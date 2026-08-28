@@ -1,0 +1,7 @@
+[user]
+    name = Sung Kwak
+    email = sunguac@gmail.com
+[core]
+    editor = vim
+[init]
+    defaultBranch = main

@@ -1,0 +1,25 @@
+# --- Themes ---
+# theme = Gruvbox Dark Hard
+theme = Rapture
+# theme = Hivacruz
+# theme = Monokai Pro Machine
+
+# --- Fonts ---
+# JetBrains Mono and Fira Code are excellent choices if you install them later
+# font-family = JetBrains Mono
+font-size = 14
+adjust-cell-height = 10%
+
+# --- Window & macOS Aesthetics ---
+# A slight transparency with a heavy blur looks great with Gruvbox
+background-opacity = 0.95
+background-blur-radius = 20
+macos-titlebar-style = transparent
+
+# Breathing room around the text
+window-padding-x = 12
+window-padding-y = 12
+
+# --- Cursor ---
+cursor-style = bar
+cursor-style-blink = false
