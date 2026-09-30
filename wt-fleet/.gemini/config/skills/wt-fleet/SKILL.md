@@ -68,16 +68,23 @@ flowchart TD
 
 ```bash
 # Initialize current tmux pane as 'mayor' and set up .worktrees/ excludes
-wt-fleet init
+# (Optional --dangerously-skip-permissions persists in .worktrees/.fleet/mayor.env so all spawned workers inherit it)
+wt-fleet init [--dangerously-skip-permissions]
+
+# Initialize current pane as 'mayor' and launch the Mayor orchestrator CLI
+# ('wt-fleet --dangerously-skip-permissions' is shorthand for 'wt-fleet mayor --dangerously-skip-permissions')
+wt-fleet mayor [--dangerously-skip-permissions]
+wt-fleet --dangerously-skip-permissions
 
 # Check all active workers, pane IDs, review status, branches, and commits ahead
 wt-fleet status
 
 # Spawn a new worker in .worktrees/<name> (branch: agent/<name>) + split tmux pane
-wt-fleet spawn <name> "<detailed task prompt>" [--base <branch>]
+# (Automatically inherits --dangerously-skip-permissions from Mayor / WT_SKIP_PERMISSIONS=1; override with --no-skip-permissions)
+wt-fleet spawn <name> "<detailed task prompt>" [--base <branch>] [--dangerously-skip-permissions|--no-skip-permissions]
 
 # Smart upsert: prompt <name> if its pane is alive, otherwise spawn it
-wt-fleet dispatch <name> "<task prompt>"
+wt-fleet dispatch <name> "<task prompt>" [--base <branch>] [--dangerously-skip-permissions|--no-skip-permissions]
 
 # Send follow-up instructions to an already-running worker pane
 wt-fleet prompt <name> "<follow-up instructions>"
