@@ -87,7 +87,11 @@ wt-fleet spawn <name> "<detailed task prompt>" [--base <branch>] [--dangerously-
 wt-fleet dispatch <name> "<task prompt>" [--base <branch>] [--dangerously-skip-permissions|--no-skip-permissions]
 
 # Send follow-up instructions to an already-running worker pane
-wt-fleet prompt <name> "<follow-up instructions>"
+wt-fleet prompt <name> "<follow-up instructions>" [--delivery <smart|inbox|push>]
+
+# Inspect, flush, or clear queued replies from .worktrees/.fleet/inbox.log
+# (When delivery mode is 'smart' [default], replies are automatically queued to inbox if the target pane has active user typing or an interactive modal)
+wt-fleet inbox [list|--flush [--inject]|--clear]
 
 # Update review state (used by Staff Engineer subagent)
 wt-fleet review-status <name> <REVIEWING|APPROVED|CHANGES_REQUESTED|ESCALATED> "[summary]"
@@ -113,8 +117,11 @@ wt-fleet teardown <name|all> [--force]
    `agent/<name>` so `git status --porcelain` is empty.
 4. **Reply to Mayor When Done or Blocked**:
    ```bash
+   # Default WT_DELIVERY_MODE=smart injects directly if the Mayor prompt is empty/idle,
+   # or queues to .worktrees/.fleet/inbox.log + fires a tmux status toast if the user is typing or a modal is open.
    wt-fleet reply "[DONE] Implemented X in commit <sha>; ran <test-cmd> (all pass)."
    wt-fleet reply "[BLOCKED] Need clarification on X."
+   wt-fleet reply --delivery <smart|inbox|push> "[DONE] ..."
    ```
 5. **Stay Open**: Remain idle at the prompt for Staff Engineer review feedback
    or follow-up tasks.
