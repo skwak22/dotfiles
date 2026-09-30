@@ -1,0 +1,1078 @@
+#!/usr/bin/env bash
+# wt-fleet — Portable Git Worktree + tmux Multi-Agent Orchestrator
+#
+# Zero external dependencies beyond bash, git, and tmux (works on macOS & Linux).
+# Manages isolated git worktrees (.worktrees/<name> on branch agent/<name>)
+# paired with tmux panes (capped at 4 panes per window) and cross-pane messaging.
+
+set -euo pipefail
+
+# Load optional machine-local overrides (e.g. WT_AGENT_CLI) outside of dotfiles
+[[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/wt-fleet/config" ]] && source "${XDG_CONFIG_HOME:-$HOME/.config}/wt-fleet/config"
+
+VERSION="1.1.0"
+MAX_PANES_PER_WINDOW="${WT_MAX_PANES:-4}"
+DEFAULT_WORKER_PERSONA="${WT_WORKER_PERSONA:-worker}"
+DEFAULT_MAYOR_PERSONA="${WT_MAYOR_PERSONA:-mayor}"
+DEFAULT_LAYOUT="${WT_LAYOUT:-tiled}"
+
+# Auto-detect agent CLI if WT_AGENT_CLI is not explicitly set
+detect_agent_cli() {
+  if [[ -n "${WT_AGENT_CLI:-}" ]]; then
+    echo "$WT_AGENT_CLI"
+    return 0
+  fi
+  for candidate in gemini claude codex aider; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  echo "gemini"
+}
+
+DEFAULT_AGENT_CLI="$(detect_agent_cli)"
+
+# --- Helpers ---
+
+die() {
+  printf "\033[1;31merror:\033[0m %s\n" "$*" >&2
+  exit 1
+}
+
+info() {
+  printf "\033[1;36m[wt-fleet]\033[0m %s\n" "$*"
+}
+
+warn() {
+  printf "\033[1;33m[wt-fleet warn]\033[0m %s\n" "$*" >&2
+}
+
+require_tmux() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is not installed or not in PATH"
+  [[ -n "${TMUX:-}" || -n "${TMUX_PANE:-}" ]] || die "must be run inside an active tmux session (\$TMUX / \$TMUX_PANE unset)"
+}
+
+# Resolve main repository root even when invoked from inside a linked git worktree.
+get_main_repo_root() {
+  local common_dir=""
+  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  if [[ -z "$common_dir" && -n "${TMUX_PANE:-}" ]]; then
+    local pane_cwd
+    pane_cwd=$(tmux display-message -t "$TMUX_PANE" -p '#{pane_current_path}' 2>/dev/null || true)
+    if [[ -n "$pane_cwd" ]]; then
+      common_dir=$(git -C "$pane_cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    fi
+  fi
+  [[ -n "$common_dir" ]] || die "not inside a git repository (run from your git repo root or worktree)"
+  if [[ "$(basename "$common_dir")" == ".git" ]]; then
+    dirname "$common_dir"
+  else
+    echo "$common_dir"
+  fi
+}
+
+# Ensure .worktrees/ and .wt-*.md files are excluded locally via .git/info/exclude
+# so they never dirty git status in the main repo or any worktree.
+ensure_git_excludes() {
+  local repo_root="$1"
+  local common_dir
+  common_dir=$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)
+  local exclude_file="${common_dir}/info/exclude"
+  mkdir -p "$(dirname "$exclude_file")"
+  touch "$exclude_file"
+  for pattern in ".worktrees/" ".wt-task.md" ".wt-review.md" ".wt-spec.md"; do
+    if ! grep -qxF "$pattern" "$exclude_file" 2>/dev/null; then
+      echo "$pattern" >> "$exclude_file"
+    fi
+  done
+}
+
+fleet_dir() {
+  local repo_root="$1"
+  echo "${repo_root}/.worktrees/.fleet"
+}
+
+registry_md_path() {
+  local repo_root="$1"
+  echo "${repo_root}/.worktrees/REGISTRY.md"
+}
+
+sanitize_name() {
+  local raw="$1"
+  echo "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^-+//; s/-+$//'
+}
+
+# --- Native tmux Cross-Pane Primitives (Zero External Binary Dependencies) ---
+
+pane_is_alive() {
+  local pane_id="$1"
+  [[ -n "$pane_id" ]] || return 1
+  tmux display-message -t "$pane_id" -p '#{pane_id}' >/dev/null 2>&1
+}
+
+pane_set_label() {
+  local pane_id="$1"
+  local label="$2"
+  tmux set-option -p -t "$pane_id" @name "$label" >/dev/null 2>&1 || true
+}
+
+pane_capture() {
+  local pane_id="$1"
+  local lines="${2:-40}"
+  tmux capture-pane -t "$pane_id" -p -J -S "-${lines}"
+}
+
+# Send a tagged message into another agent's interactive TUI pane and submit with Enter.
+pane_send_message() {
+  local target_pane="$1"
+  local text="$2"
+  local sender_pane="${TMUX_PANE:-}"
+  local from="orchestrator"
+  local session_win="?"
+  if [[ -n "$sender_pane" ]] && pane_is_alive "$sender_pane"; then
+    local lbl
+    lbl=$(tmux display-message -t "$sender_pane" -p '#{@name}' 2>/dev/null || true)
+    from="${lbl:-$sender_pane}"
+    session_win=$(tmux display-message -t "$sender_pane" -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
+  fi
+
+  local header="[wt-fleet from:${from} pane:${sender_pane:-?} at:${session_win}]"
+  tmux send-keys -t "$target_pane" -l -- "${header} ${text}"
+  sleep 0.15
+  tmux send-keys -t "$target_pane" Enter
+}
+
+# Resolve a pane label within the current repo (.fleet/<name>.env) or current tmux session.
+resolve_pane_quiet() {
+  local label="$1"
+  local repo_root="${2:-}"
+  if [[ -z "$repo_root" ]]; then
+    repo_root=$(get_main_repo_root 2>/dev/null || true)
+  fi
+
+  # 1. Check repo-specific state file first
+  if [[ -n "$repo_root" ]]; then
+    local fdir
+    fdir=$(fleet_dir "$repo_root")
+    if [[ "$label" == "mayor" && -f "${fdir}/mayor.pane" ]]; then
+      local saved_mayor
+      saved_mayor=$(cat "${fdir}/mayor.pane" 2>/dev/null || true)
+      if pane_is_alive "$saved_mayor"; then
+        echo "$saved_mayor"
+        return 0
+      fi
+    elif [[ -f "${fdir}/${label}.env" ]]; then
+      local saved_pane
+      saved_pane=$(awk -F= '/^PANE_ID=/{print $2}' "${fdir}/${label}.env" | tr -d "'\"" 2>/dev/null || true)
+      if pane_is_alive "$saved_pane"; then
+        echo "$saved_pane"
+        return 0
+      fi
+    fi
+  fi
+
+  # 2. Search panes in the current tmux session
+  local session_match=""
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    session_match=$(tmux list-panes -s -t "$TMUX_PANE" -F '#{pane_id} #{@name}' 2>/dev/null \
+      | awk -v lbl="$label" '$2 == lbl { print $1; exit }' || true)
+    if pane_is_alive "$session_match"; then
+      echo "$session_match"
+      return 0
+    fi
+  fi
+
+  # 3. Fallback: search all panes on the tmux server
+  tmux list-panes -a -F '#{pane_id} #{@name}' 2>/dev/null \
+    | awk -v lbl="$label" '$2 == lbl { print $1; exit }' || true
+}
+
+# Ensure the orchestrator pane for this repo/session is labeled 'mayor'
+ensure_mayor_pane() {
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  mkdir -p "$fdir"
+
+  local mayor_pane
+  mayor_pane=$(resolve_pane_quiet "mayor" "$repo_root")
+  if pane_is_alive "$mayor_pane"; then
+    echo "$mayor_pane" > "${fdir}/mayor.pane"
+    echo "$mayor_pane"
+    return 0
+  fi
+  if [[ -n "${TMUX_PANE:-}" ]] && pane_is_alive "$TMUX_PANE"; then
+    pane_set_label "$TMUX_PANE" "mayor"
+    local cur_branch
+    cur_branch=$(git -C "$repo_root" branch --show-current 2>/dev/null || echo "main")
+    tmux set-option -p -t "$TMUX_PANE" @branch "$cur_branch" >/dev/null 2>&1 || true
+    echo "$TMUX_PANE" > "${fdir}/mayor.pane"
+    echo "$TMUX_PANE"
+    return 0
+  fi
+  die "could not determine or label the 'mayor' tmux pane"
+}
+
+# Rebalance panes in a window based on count (2 -> even-horizontal, 3..4 -> tiled/custom)
+rebalance_window() {
+  local win_target="$1"
+  local requested_layout="${2:-$DEFAULT_LAYOUT}"
+  local count
+  count=$(tmux list-panes -t "$win_target" 2>/dev/null | wc -l | tr -d ' ')
+  if (( count <= 1 )); then
+    return 0
+  elif (( count == 2 )) && [[ "$requested_layout" == "tiled" ]]; then
+    tmux select-layout -t "$win_target" even-horizontal >/dev/null 2>&1 || true
+  else
+    tmux select-layout -t "$win_target" "$requested_layout" >/dev/null 2>&1 || true
+  fi
+}
+
+# Allocate a non-conflicting port offset (100, 200, ..., 900)
+allocate_port_offset() {
+  local fdir="$1"
+  local offset=100
+  while (( offset <= 900 )); do
+    local used=false
+    for env_file in "$fdir"/*.env; do
+      [[ -f "$env_file" ]] || continue
+      if grep -q "^PORT_OFFSET=${offset}$" "$env_file" 2>/dev/null; then
+        used=true
+        break
+      fi
+    done
+    if ! $used; then
+      echo "$offset"
+      return 0
+    fi
+    offset=$(( offset + 100 ))
+  done
+  echo "100"
+}
+
+# Build CLI invocation string for a worker pane across supported agent CLIs
+build_worker_launch_cmd() {
+  local cli="$1"
+  local persona="$2"
+  local boot_prompt="$3"
+
+  local base_cmd
+  base_cmd=$(basename "$cli")
+
+  case "$base_cmd" in
+    claude)
+      local flag=""
+      if [[ -n "$persona" && "$persona" != "default" && "$persona" != "none" ]]; then
+        flag="--agent ${persona}"
+      fi
+      if [[ -n "$boot_prompt" ]]; then
+        echo "${cli} ${flag} $(printf '%q' "$boot_prompt")"
+      else
+        echo "${cli} ${flag}"
+      fi
+      ;;
+    codex|aider)
+      if [[ -n "$boot_prompt" ]]; then
+        echo "${cli} $(printf '%q' "$boot_prompt")"
+      else
+        echo "${cli}"
+      fi
+      ;;
+    *)
+      local flag=""
+      if [[ -n "$persona" && "$persona" != "default" && "$persona" != "none" ]]; then
+        flag="--agent ${persona}"
+      fi
+      if [[ -n "$boot_prompt" ]]; then
+        echo "${cli} ${flag} -i $(printf '%q' "$boot_prompt")"
+      else
+        echo "${cli} ${flag}"
+      fi
+      ;;
+  esac
+}
+
+# Write/update .worktrees/REGISTRY.md so the Mayor agent and user have a live ledger
+update_registry_md() {
+  local repo_root="$1"
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  mkdir -p "$fdir"
+  local reg_file
+  reg_file=$(registry_md_path "$repo_root")
+
+  local mayor_pane
+  mayor_pane=$(resolve_pane_quiet "mayor" "$repo_root")
+
+  {
+    echo "# Worktree Fleet Registry"
+    echo ""
+    echo "- **Repository Root**: \`${repo_root}\`"
+    echo "- **Mayor Pane**: \`${mayor_pane:-unregistered}\`"
+    echo "- **Max Panes Per Window**: \`${MAX_PANES_PER_WINDOW}\`"
+    echo "- **Updated At**: \`$(date -u +"%Y-%m-%dT%H:%M:%SZ")\`"
+    echo ""
+    echo "## Active Workers"
+    echo ""
+    echo "| Worker | Pane | Status | Branch | Commits Ahead | Working Tree | Port Offset | Last Task / Reply |"
+    echo "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+
+    local found=false
+    for env_file in "$fdir"/*.env; do
+      [[ -f "$env_file" ]] || continue
+      found=true
+      # shellcheck disable=SC1090
+      source "$env_file"
+      local live_pane
+      live_pane=$(resolve_pane_quiet "$WORKER_NAME" "$repo_root")
+      local pane_status="$STATUS"
+      if ! pane_is_alive "$live_pane"; then
+        live_pane="closed"
+        pane_status="PANE_CLOSED"
+      fi
+
+      local ahead="0"
+      local dirty="clean"
+      if [[ -d "$WORKTREE_PATH" ]]; then
+        ahead=$(git -C "$WORKTREE_PATH" rev-list --count "${BASE_BRANCH}..HEAD" 2>/dev/null || echo "?")
+        if [[ -n "$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)" ]]; then
+          dirty="modified"
+        fi
+      else
+        dirty="missing"
+      fi
+
+      local summary="${LAST_REPLY:-$LAST_TASK}"
+      summary="${summary//|/\\|}"
+      summary="${summary//$'\n'/ }"
+      if (( ${#summary} > 80 )); then
+        summary="${summary:0:77}..."
+      fi
+
+      echo "| \`${WORKER_NAME}\` | \`${live_pane}\` | **${pane_status}** | \`${BRANCH}\` | +${ahead} | ${dirty} | +${PORT_OFFSET} | ${summary} |"
+    done
+
+    if ! $found; then
+      echo "| *(none)* | - | - | - | - | - | - | - |"
+    fi
+  } > "$reg_file"
+}
+
+# --- Subcommands ---
+
+cmd_init() {
+  require_tmux
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  ensure_git_excludes "$repo_root"
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  mkdir -p "$fdir"
+
+  local mayor_pane="${TMUX_PANE}"
+  pane_set_label "$mayor_pane" "mayor"
+  echo "$mayor_pane" > "${fdir}/mayor.pane"
+  local cur_branch
+  cur_branch=$(git -C "$repo_root" branch --show-current 2>/dev/null || echo "main")
+  tmux set-option -p -t "$mayor_pane" @branch "$cur_branch" >/dev/null 2>&1 || true
+
+  update_registry_md "$repo_root"
+  info "Initialized wt-fleet in ${repo_root}"
+  info "Current pane (${mayor_pane}) registered as 'mayor' on branch '${cur_branch}'."
+  info "Registry: $(registry_md_path "$repo_root")"
+}
+
+cmd_mayor() {
+  cmd_init
+  info "Launching Mayor (Orchestrator) agent via ${DEFAULT_AGENT_CLI}..."
+  exec "$DEFAULT_AGENT_CLI" --agent "$DEFAULT_MAYOR_PERSONA" "$@"
+}
+
+cmd_spawn() {
+  require_tmux
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  ensure_git_excludes "$repo_root"
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  mkdir -p "$fdir"
+
+  local raw_name=""
+  local prompt=""
+  local base_branch=""
+  local layout="$DEFAULT_LAYOUT"
+  local overflow_window=false
+  local reuse_existing=false
+  local worker_persona="$DEFAULT_WORKER_PERSONA"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --base)
+        base_branch="$2"; shift 2 ;;
+      --layout)
+        layout="$2"; shift 2 ;;
+      --overflow-window)
+        overflow_window=true; shift ;;
+      --reuse)
+        reuse_existing=true; shift ;;
+      --agent)
+        worker_persona="$2"; shift 2 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      -*)
+        die "unknown flag for spawn: $1" ;;
+      *)
+        if [[ -z "$raw_name" ]]; then
+          raw_name="$1"
+        elif [[ -z "$prompt" ]]; then
+          prompt="$1"
+        else
+          prompt="${prompt} $1"
+        fi
+        shift ;;
+    esac
+  done
+
+  [[ -n "$raw_name" ]] || die "usage: wt-fleet spawn <worker-name> [\"initial prompt\"] [--base <branch>] [--reuse]"
+  local name
+  name=$(sanitize_name "$raw_name")
+  [[ -n "$name" && "$name" != "mayor" ]] || die "invalid worker name: '$raw_name' (cannot be empty or 'mayor')"
+
+  local mayor_pane
+  mayor_pane=$(ensure_mayor_pane)
+
+  # Check if worker already has a live pane
+  local existing_pane
+  existing_pane=$(resolve_pane_quiet "$name" "$repo_root")
+  if pane_is_alive "$existing_pane"; then
+    if $reuse_existing && [[ -n "$prompt" ]]; then
+      info "Worker '$name' is already running in pane ${existing_pane}; routing prompt via 'wt-fleet prompt'..."
+      cmd_prompt "$name" "$prompt"
+      return 0
+    fi
+    die "Worker '$name' already has an active pane (${existing_pane}). Use 'wt-fleet prompt $name \"...\"' to message it, or 'wt-fleet teardown $name' to remove it."
+  fi
+
+  # Check max panes in Mayor's window
+  local mayor_win
+  mayor_win=$(tmux display-message -t "$mayor_pane" -p '#{session_name}:#{window_index}')
+  local current_panes
+  current_panes=$(tmux list-panes -t "$mayor_win" | wc -l | tr -d ' ')
+
+  local target_win="$mayor_win"
+  local create_new_win=false
+  if (( current_panes >= MAX_PANES_PER_WINDOW )); then
+    if $overflow_window; then
+      create_new_win=true
+    else
+      warn "Window ${mayor_win} already has ${current_panes}/${MAX_PANES_PER_WINDOW} panes."
+      die "Max ${MAX_PANES_PER_WINDOW} panes reached in current window. Re-prompt an existing worker with 'wt-fleet prompt <name> \"...\"', tear down a finished worker with 'wt-fleet teardown <name>', or pass '--overflow-window'."
+    fi
+  fi
+
+  # Resolve base branch
+  if [[ -z "$base_branch" ]]; then
+    base_branch=$(git -C "$repo_root" branch --show-current 2>/dev/null || true)
+    [[ -n "$base_branch" ]] || base_branch="HEAD"
+  fi
+
+  local branch_name="agent/${name}"
+  local worktree_path="${repo_root}/.worktrees/${name}"
+
+  # Create or reuse git worktree
+  if [[ -d "$worktree_path" ]]; then
+    info "Reusing existing worktree at ${worktree_path} (branch ${branch_name})"
+  else
+    info "Creating git worktree .worktrees/${name} on branch ${branch_name} (from ${base_branch})..."
+    if git -C "$repo_root" show-ref --verify --quiet "refs/heads/${branch_name}"; then
+      git -C "$repo_root" worktree add "$worktree_path" "$branch_name"
+    else
+      git -C "$repo_root" worktree add -b "$branch_name" "$worktree_path" "$base_branch"
+    fi
+
+    # Copy untracked .env files if present in main repo root
+    for env_candidate in .env .env.local .env.development.local; do
+      if [[ -f "${repo_root}/${env_candidate}" && ! -f "${worktree_path}/${env_candidate}" ]]; then
+        cp "${repo_root}/${env_candidate}" "${worktree_path}/${env_candidate}"
+        info "Copied ${env_candidate} into worktree"
+      fi
+    done
+
+    # Run optional repo hook (.wt-setup) if executable
+    if [[ -x "${repo_root}/.wt-setup" ]]; then
+      info "Running .wt-setup hook in worktree..."
+      (cd "$worktree_path" && "${repo_root}/.wt-setup" "$name" "$branch_name")
+    fi
+  fi
+
+  local port_offset
+  port_offset=$(allocate_port_offset "$fdir")
+
+  # Create tmux pane in the same window (up to MAX_PANES_PER_WINDOW)
+  local new_pane=""
+  if $create_new_win; then
+    new_pane=$(tmux new-window -d -n "wt:${name}" -c "$worktree_path" -P -F '#{pane_id}')
+  else
+    new_pane=$(tmux split-window -d -h -t "$target_win" -c "$worktree_path" -P -F '#{pane_id}')
+    rebalance_window "$target_win" "$layout"
+    # Keep cursor focus on the mayor pane
+    tmux select-pane -t "$mayor_pane" >/dev/null 2>&1 || true
+  fi
+
+  # Label pane for native lookup and tmux border status
+  pane_set_label "$new_pane" "$name"
+  tmux set-option -p -t "$new_pane" @branch "$branch_name" >/dev/null 2>&1 || true
+
+  # Write task file inside the worktree
+  local task_file="${worktree_path}/.wt-task.md"
+  cat > "$task_file" <<EOF
+# Worker Task Brief: ${name}
+
+- **Worker Label**: \`${name}\`
+- **Assigned Pane**: \`${new_pane}\`
+- **Mayor (Orchestrator) Pane**: \`${mayor_pane}\`
+- **Git Branch**: \`${branch_name}\` (based on \`${base_branch}\`)
+- **Worktree Path**: \`${worktree_path}\`
+- **Port Offset**: \`${port_offset}\` (e.g., use port \$((3000 + ${port_offset})) for dev servers)
+
+## Instructions
+1. Stay strictly inside \`${worktree_path}\` on branch \`${branch_name}\`. Do not touch files in the parent repo root.
+2. Implement the task below, run tests/builds to verify, and commit your changes cleanly to \`${branch_name}\`.
+3. When you finish (or if you are blocked and need clarification), notify the Mayor pane by running:
+   \`\`\`bash
+   wt-fleet reply "[DONE] <concise summary of commits and test verification>"
+   \`\`\`
+   or:
+   \`\`\`bash
+   wt-fleet reply "[BLOCKED] <concise question for the Mayor>"
+   \`\`\`
+
+## Initial Task
+${prompt:-Await instructions from Mayor.}
+EOF
+
+  # Save worker state
+  local init_status="IDLE"
+  [[ -n "$prompt" ]] && init_status="WORKING"
+  local env_file="${fdir}/${name}.env"
+  cat > "$env_file" <<EOF
+WORKER_NAME=$(printf '%q' "$name")
+BRANCH=$(printf '%q' "$branch_name")
+BASE_BRANCH=$(printf '%q' "$base_branch")
+WORKTREE_PATH=$(printf '%q' "$worktree_path")
+PANE_ID=$(printf '%q' "$new_pane")
+MAYOR_PANE=$(printf '%q' "$mayor_pane")
+PORT_OFFSET=$(printf '%q' "$port_offset")
+STATUS=$(printf '%q' "$init_status")
+REVIEW_ROUND="0"
+CREATED_AT=$(printf '%q' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")")
+LAST_TASK=$(printf '%q' "${prompt:-(spawned, awaiting task)}")
+LAST_REPLY=""
+EOF
+
+  update_registry_md "$repo_root"
+
+  # Construct startup command inside the worker pane
+  local boot_prompt=""
+  if [[ -n "$prompt" ]]; then
+    boot_prompt="You are Worker '${name}' in isolated git worktree '${worktree_path}' on branch '${branch_name}' (base: '${base_branch}'). Read .wt-task.md for full context. Execute your assigned task, commit your verified changes to '${branch_name}', and when finished or blocked run: wt-fleet reply \"[DONE|BLOCKED] <concise summary>\". Task: ${prompt}"
+  fi
+
+  local cli_invocation
+  cli_invocation=$(build_worker_launch_cmd "$DEFAULT_AGENT_CLI" "$worker_persona" "$boot_prompt")
+  local launch_cmd="export WT_WORKER_NAME=$(printf '%q' "$name") WT_BRANCH=$(printf '%q' "$branch_name") WT_BASE_BRANCH=$(printf '%q' "$base_branch") WT_MAYOR_PANE=$(printf '%q' "$mayor_pane") WT_PORT_OFFSET=$(printf '%q' "$port_offset"); ${cli_invocation}"
+
+  tmux send-keys -t "$new_pane" -l -- "$launch_cmd"
+  tmux send-keys -t "$new_pane" Enter
+
+  info "Spawned worker '${name}' in pane ${new_pane} (branch: ${branch_name}, path: ${worktree_path})"
+}
+
+cmd_dispatch() {
+  require_tmux
+  [[ $# -ge 2 ]] || die "usage: wt-fleet dispatch <worker-name> \"<prompt>\" [--base <branch>]"
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local name
+  name=$(sanitize_name "$1")
+  shift
+  local prompt="$1"
+  shift
+  local existing_pane
+  existing_pane=$(resolve_pane_quiet "$name" "$repo_root")
+  if pane_is_alive "$existing_pane"; then
+    cmd_prompt "$name" "$prompt"
+  else
+    cmd_spawn "$name" "$prompt" "$@"
+  fi
+}
+
+cmd_prompt() {
+  require_tmux
+  [[ $# -ge 2 ]] || die "usage: wt-fleet prompt <worker-name> \"<follow-up prompt>\""
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+
+  local name
+  name=$(sanitize_name "$1")
+  shift
+  local prompt="$*"
+
+  local target_pane
+  target_pane=$(resolve_pane_quiet "$name" "$repo_root")
+  pane_is_alive "$target_pane" || die "No active pane found for worker '${name}'. Run 'wt-fleet status' or respawn with 'wt-fleet spawn ${name} \"...\"'."
+
+  local env_file="${fdir}/${name}.env"
+  if [[ -f "$env_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$env_file"
+    cat > "$env_file" <<EOF
+WORKER_NAME=$(printf '%q' "$WORKER_NAME")
+BRANCH=$(printf '%q' "$BRANCH")
+BASE_BRANCH=$(printf '%q' "$BASE_BRANCH")
+WORKTREE_PATH=$(printf '%q' "$WORKTREE_PATH")
+PANE_ID=$(printf '%q' "$target_pane")
+MAYOR_PANE=$(printf '%q' "${MAYOR_PANE:-}")
+PORT_OFFSET=$(printf '%q' "${PORT_OFFSET:-100}")
+STATUS="WORKING"
+REVIEW_ROUND=$(printf '%q' "${REVIEW_ROUND:-0}")
+CREATED_AT=$(printf '%q' "${CREATED_AT:-}")
+LAST_TASK=$(printf '%q' "$prompt")
+LAST_REPLY=$(printf '%q' "${LAST_REPLY:-}")
+EOF
+    if [[ -d "$WORKTREE_PATH" ]]; then
+      {
+        echo ""
+        echo "## Follow-up Task ($(date -u +"%Y-%m-%dT%H:%M:%SZ"))"
+        echo "$prompt"
+      } >> "${WORKTREE_PATH}/.wt-task.md"
+    fi
+  fi
+
+  update_registry_md "$repo_root"
+
+  local formatted_msg="${prompt} (When finished or blocked, run: wt-fleet reply \"[DONE|BLOCKED] <concise summary>\")"
+  pane_send_message "$target_pane" "$formatted_msg"
+  info "Sent prompt to worker '${name}' (pane ${target_pane})."
+}
+
+cmd_reply() {
+  require_tmux
+  [[ $# -ge 1 ]] || die "usage: wt-fleet reply \"[DONE|BLOCKED] <summary>\""
+  local message="$*"
+
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+
+  local worker_name="${WT_WORKER_NAME:-}"
+  if [[ -z "$worker_name" && -n "${TMUX_PANE:-}" ]]; then
+    worker_name=$(tmux display-message -t "$TMUX_PANE" -p '#{@name}' 2>/dev/null || true)
+  fi
+
+  local mayor_pane
+  mayor_pane=$(resolve_pane_quiet "mayor" "$repo_root")
+  if ! pane_is_alive "$mayor_pane" && [[ -n "${WT_MAYOR_PANE:-}" ]]; then
+    mayor_pane="$WT_MAYOR_PANE"
+  fi
+  pane_is_alive "$mayor_pane" || die "Cannot find 'mayor' pane to reply to."
+
+  if [[ -n "$worker_name" && -f "${fdir}/${worker_name}.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${fdir}/${worker_name}.env"
+    local new_status="AWAITING_REVIEW"
+    if [[ "$message" == *"[BLOCKED]"* || "$message" == *"BLOCKED:"* ]]; then
+      new_status="BLOCKED"
+    elif [[ "$message" == *"[PROGRESS]"* ]]; then
+      new_status="WORKING"
+    fi
+    cat > "${fdir}/${worker_name}.env" <<EOF
+WORKER_NAME=$(printf '%q' "$WORKER_NAME")
+BRANCH=$(printf '%q' "$BRANCH")
+BASE_BRANCH=$(printf '%q' "$BASE_BRANCH")
+WORKTREE_PATH=$(printf '%q' "$WORKTREE_PATH")
+PANE_ID=$(printf '%q' "${PANE_ID:-}")
+MAYOR_PANE=$(printf '%q' "$mayor_pane")
+PORT_OFFSET=$(printf '%q' "${PORT_OFFSET:-100}")
+STATUS=$(printf '%q' "$new_status")
+REVIEW_ROUND=$(printf '%q' "${REVIEW_ROUND:-0}")
+CREATED_AT=$(printf '%q' "${CREATED_AT:-}")
+LAST_TASK=$(printf '%q' "${LAST_TASK:-}")
+LAST_REPLY=$(printf '%q' "$message")
+EOF
+  fi
+
+  update_registry_md "$repo_root"
+  pane_send_message "$mayor_pane" "$message"
+  info "Delivered reply to mayor (${mayor_pane})."
+}
+
+cmd_review_status() {
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  [[ $# -ge 2 ]] || die "usage: wt-fleet review-status <worker-name> <REVIEWING|APPROVED|CHANGES_REQUESTED|ESCALATED> [\"summary\"]"
+
+  local name
+  name=$(sanitize_name "$1")
+  local verdict="$2"
+  shift 2
+  local summary="${*:-}"
+
+  local env_file="${fdir}/${name}.env"
+  [[ -f "$env_file" ]] || die "unknown worker '${name}'"
+  # shellcheck disable=SC1090
+  source "$env_file"
+
+  local round="${REVIEW_ROUND:-0}"
+  local new_status="$verdict"
+  case "$verdict" in
+    REVIEWING)
+      new_status="REVIEWING(R$((round + 1)))"
+      ;;
+    CHANGES_REQUESTED)
+      round=$((round + 1))
+      new_status="CHANGES_REQ(R${round})"
+      ;;
+    APPROVED)
+      new_status="APPROVED"
+      ;;
+    ESCALATED)
+      new_status="ESCALATED"
+      ;;
+  esac
+
+  local updated_reply="${LAST_REPLY:-}"
+  if [[ -n "$summary" ]]; then
+    updated_reply="[${new_status}] ${summary}"
+  fi
+
+  cat > "$env_file" <<EOF
+WORKER_NAME=$(printf '%q' "$WORKER_NAME")
+BRANCH=$(printf '%q' "$BRANCH")
+BASE_BRANCH=$(printf '%q' "$BASE_BRANCH")
+WORKTREE_PATH=$(printf '%q' "$WORKTREE_PATH")
+PANE_ID=$(printf '%q' "${PANE_ID:-}")
+MAYOR_PANE=$(printf '%q' "${MAYOR_PANE:-}")
+PORT_OFFSET=$(printf '%q' "${PORT_OFFSET:-100}")
+STATUS=$(printf '%q' "$new_status")
+REVIEW_ROUND=$(printf '%q' "$round")
+CREATED_AT=$(printf '%q' "${CREATED_AT:-}")
+LAST_TASK=$(printf '%q' "${LAST_TASK:-}")
+LAST_REPLY=$(printf '%q' "$updated_reply")
+EOF
+
+  update_registry_md "$repo_root"
+  info "Updated worker '${name}' review status -> ${new_status} (round ${round})."
+}
+
+cmd_read() {
+  require_tmux
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  [[ $# -ge 1 ]] || die "usage: wt-fleet read <worker-name> [lines]"
+  local name
+  name=$(sanitize_name "$1")
+  local lines="${2:-40}"
+  local target_pane
+  target_pane=$(resolve_pane_quiet "$name" "$repo_root")
+  pane_is_alive "$target_pane" || die "No active pane found for worker '${name}'"
+  pane_capture "$target_pane" "$lines"
+}
+
+cmd_status() {
+  require_tmux
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  if [[ "${1:-}" == "--watch" ]]; then
+    if command -v watch >/dev/null 2>&1; then
+      watch -n 2 -c "$0 status"
+    else
+      while true; do
+        clear
+        "$0" status
+        sleep 2
+      done
+    fi
+    return 0
+  fi
+
+  update_registry_md "$repo_root"
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  local mayor_pane
+  mayor_pane=$(resolve_pane_quiet "mayor" "$repo_root")
+  local mayor_win=""
+  if pane_is_alive "$mayor_pane"; then
+    mayor_win=$(tmux display-message -t "$mayor_pane" -p '#{session_name}:#{window_index}')
+  fi
+  local win_panes="?"
+  if [[ -n "$mayor_win" ]]; then
+    win_panes=$(tmux list-panes -t "$mayor_win" 2>/dev/null | wc -l | tr -d ' ')
+  fi
+
+  printf "\033[1;36m=== Worktree Fleet Status (%s) ===\033[0m\n" "$(basename "$repo_root")"
+  printf "Mayor Pane: \033[1;32m%s\033[0m  |  Window Panes: \033[1;33m%s/%s\033[0m  |  CLI: \033[1;35m%s\033[0m\n\n" \
+    "${mayor_pane:-unregistered}" "$win_panes" "$MAX_PANES_PER_WINDOW" "$DEFAULT_AGENT_CLI"
+
+  printf "%-16s %-8s %-15s %-22s %-8s %-10s %s\n" \
+    "WORKER" "PANE" "STATUS" "BRANCH" "AHEAD" "TREE" "LAST TASK / REPLY"
+  printf "%-16s %-8s %-15s %-22s %-8s %-10s %s\n" \
+    "------" "----" "------" "------" "-----" "----" "-----------------"
+
+  local found=false
+  for env_file in "$fdir"/*.env; do
+    [[ -f "$env_file" ]] || continue
+    found=true
+    # shellcheck disable=SC1090
+    source "$env_file"
+    local live_pane
+    live_pane=$(resolve_pane_quiet "$WORKER_NAME" "$repo_root")
+    local st="$STATUS"
+    if ! pane_is_alive "$live_pane"; then
+      live_pane="closed"
+      st="PANE_CLOSED"
+    fi
+    local ahead="0"
+    local dirty="clean"
+    if [[ -d "$WORKTREE_PATH" ]]; then
+      ahead=$(git -C "$WORKTREE_PATH" rev-list --count "${BASE_BRANCH}..HEAD" 2>/dev/null || echo "?")
+      if [[ -n "$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)" ]]; then
+        dirty="modified"
+      fi
+    else
+      dirty="missing"
+    fi
+    local note="${LAST_REPLY:-$LAST_TASK}"
+    note="${note//$'\n'/ }"
+    if (( ${#note} > 52 )); then
+      note="${note:0:49}..."
+    fi
+    printf "%-16s %-8s %-15s %-22s %-8s %-10s %s\n" \
+      "$WORKER_NAME" "$live_pane" "$st" "$BRANCH" "+${ahead}" "$dirty" "$note"
+  done
+
+  if ! $found; then
+    echo "(no active worktree workers)"
+  fi
+}
+
+cmd_diff() {
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  [[ $# -ge 1 ]] || die "usage: wt-fleet diff <worker-name> [--stat]"
+  local name
+  name=$(sanitize_name "$1")
+  shift
+  local env_file="${fdir}/${name}.env"
+  [[ -f "$env_file" ]] || die "unknown worker '${name}'"
+  # shellcheck disable=SC1090
+  source "$env_file"
+  [[ -d "$WORKTREE_PATH" ]] || die "worktree directory missing: ${WORKTREE_PATH}"
+
+  info "Commits on ${BRANCH} (since ${BASE_BRANCH}):"
+  git -C "$WORKTREE_PATH" log --oneline "${BASE_BRANCH}..HEAD" || true
+  echo ""
+  info "Uncommitted working tree status in ${WORKTREE_PATH}:"
+  git -C "$WORKTREE_PATH" status -s || true
+  echo ""
+  info "Diff against ${BASE_BRANCH}:"
+  git -C "$WORKTREE_PATH" diff "${BASE_BRANCH}" "$@"
+}
+
+cmd_merge() {
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  [[ $# -ge 1 ]] || die "usage: wt-fleet merge <worker-name> [--squash] [--teardown]"
+  local name
+  name=$(sanitize_name "$1")
+  shift
+
+  local squash=false
+  local teardown_after=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --squash) squash=true; shift ;;
+      --teardown) teardown_after=true; shift ;;
+      *) die "unknown flag for merge: $1" ;;
+    esac
+  done
+
+  local env_file="${fdir}/${name}.env"
+  [[ -f "$env_file" ]] || die "unknown worker '${name}'"
+  # shellcheck disable=SC1090
+  source "$env_file"
+
+  if [[ -d "$WORKTREE_PATH" && -n "$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)" ]]; then
+    git -C "$WORKTREE_PATH" status -s >&2
+    die "Worktree '${name}' has uncommitted changes. Prompt the worker to commit them first: wt-fleet prompt ${name} \"Please commit your pending changes\""
+  fi
+
+  info "Merging branch '${BRANCH}' into main repository (${repo_root})..."
+  if $squash; then
+    git -C "$repo_root" merge --squash "$BRANCH"
+    info "Squash-merged '${BRANCH}' (staged in ${repo_root}; run 'git commit' to finalize)."
+  else
+    git -C "$repo_root" merge --no-ff -m "Merge branch '${BRANCH}' from worker ${name}" "$BRANCH"
+    info "Successfully merged '${BRANCH}'."
+  fi
+
+  if $teardown_after; then
+    cmd_teardown "$name"
+  else
+    cat > "$env_file" <<EOF
+WORKER_NAME=$(printf '%q' "$WORKER_NAME")
+BRANCH=$(printf '%q' "$BRANCH")
+BASE_BRANCH=$(printf '%q' "$BASE_BRANCH")
+WORKTREE_PATH=$(printf '%q' "$WORKTREE_PATH")
+PANE_ID=$(printf '%q' "${PANE_ID:-}")
+MAYOR_PANE=$(printf '%q' "${MAYOR_PANE:-}")
+PORT_OFFSET=$(printf '%q' "${PORT_OFFSET:-100}")
+STATUS="MERGED"
+REVIEW_ROUND=$(printf '%q' "${REVIEW_ROUND:-0}")
+CREATED_AT=$(printf '%q' "${CREATED_AT:-}")
+LAST_TASK=$(printf '%q' "${LAST_TASK:-}")
+LAST_REPLY=$(printf '%q' "${LAST_REPLY:-}")
+EOF
+    update_registry_md "$repo_root"
+  fi
+}
+
+cmd_teardown() {
+  require_tmux
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  [[ $# -ge 1 ]] || die "usage: wt-fleet teardown <worker-name|all> [--force]"
+
+  local target_name="$1"
+  shift
+  local force=false
+  if [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]]; then
+    force=true
+  fi
+
+  if [[ "$target_name" == "all" ]]; then
+    for env_file in "$fdir"/*.env; do
+      [[ -f "$env_file" ]] || continue
+      # shellcheck disable=SC1090
+      source "$env_file"
+      if $force; then
+        cmd_teardown "$WORKER_NAME" --force
+      else
+        cmd_teardown "$WORKER_NAME"
+      fi
+    done
+    return 0
+  fi
+
+  local name
+  name=$(sanitize_name "$target_name")
+  local env_file="${fdir}/${name}.env"
+  local worktree_path="${repo_root}/.worktrees/${name}"
+  local branch_name="agent/${name}"
+
+  if [[ -f "$env_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$env_file"
+    worktree_path="${WORKTREE_PATH:-$worktree_path}"
+    branch_name="${BRANCH:-$branch_name}"
+  fi
+
+  # 1. Close tmux pane if alive and rebalance window
+  local live_pane
+  live_pane=$(resolve_pane_quiet "$name" "$repo_root")
+  if pane_is_alive "$live_pane"; then
+    local win_target
+    win_target=$(tmux display-message -t "$live_pane" -p '#{session_name}:#{window_index}' 2>/dev/null || true)
+    info "Closing tmux pane ${live_pane} for worker '${name}'..."
+    tmux kill-pane -t "$live_pane" >/dev/null 2>&1 || true
+    if [[ -n "$win_target" ]]; then
+      rebalance_window "$win_target" "$DEFAULT_LAYOUT"
+    fi
+  fi
+
+  # 2. Remove git worktree
+  if [[ -d "$worktree_path" ]]; then
+    info "Removing git worktree ${worktree_path}..."
+    rm -f "${worktree_path}/.wt-task.md" "${worktree_path}/.wt-review.md" "${worktree_path}/.wt-spec.md"
+    if $force; then
+      git -C "$repo_root" worktree remove --force "$worktree_path"
+    else
+      git -C "$repo_root" worktree remove "$worktree_path" \
+        || die "Worktree '${name}' has untracked/modified files. Re-run with 'wt-fleet teardown ${name} --force' to discard."
+    fi
+  fi
+  git -C "$repo_root" worktree prune >/dev/null 2>&1 || true
+
+  # 3. Delete branch if merged (or if --force)
+  if git -C "$repo_root" show-ref --verify --quiet "refs/heads/${branch_name}"; then
+    if $force; then
+      git -C "$repo_root" branch -D "$branch_name" >/dev/null 2>&1 || true
+    else
+      git -C "$repo_root" branch -d "$branch_name" >/dev/null 2>&1 \
+        || warn "Branch '${branch_name}' is not fully merged; kept branch ref (pass --force to delete unmerged branch)."
+    fi
+  fi
+
+  rm -f "$env_file"
+  update_registry_md "$repo_root"
+  info "Tore down worker '${name}'."
+}
+
+usage() {
+  cat <<'EOF'
+wt-fleet — Portable Git Worktree + tmux Multi-Agent Orchestrator (max 4 panes/window)
+
+Usage:
+  wt-fleet init                                    Label current pane as 'mayor' & init .worktrees/
+  wt-fleet mayor [cli-flags...]                    Init current pane and launch '<agent-cli> --agent mayor'
+  wt-fleet spawn <name> "<prompt>" [options]       Create git worktree + tmux pane & start worker agent
+      --base <branch>                              Base branch for worktree (default: current branch)
+      --reuse                                      If worker pane already exists, send prompt to it
+      --layout <tiled|main-vertical|even-horizontal>
+      --overflow-window                            Allow opening a new window if current has 4 panes
+  wt-fleet dispatch <name> "<prompt>" [options]    Upsert: prompt existing worker or spawn new one
+  wt-fleet prompt <name> "<follow-up prompt>"      Send follow-up instructions to existing worker pane
+  wt-fleet reply "[DONE|BLOCKED] <summary>"        (Used by workers) Send status reply back to 'mayor'
+  wt-fleet review-status <name> <VERDICT> [msg]    (Used by staff) Set REVIEWING|APPROVED|CHANGES_REQUESTED|ESCALATED
+  wt-fleet status [--watch]                        Show table of all active worktrees, panes, and branches
+  wt-fleet read <name> [lines]                     Capture recent terminal output from worker pane
+  wt-fleet diff <name> [--stat]                    Show commits and diff for worker's branch/worktree
+  wt-fleet merge <name> [--squash] [--teardown]    Merge worker's branch into main repo (& optional teardown)
+  wt-fleet teardown <name|all> [--force]           Kill worker pane, rebalance layout, remove worktree
+EOF
+}
+
+# --- Main Dispatch ---
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  init)                cmd_init "$@" ;;
+  mayor)               cmd_mayor "$@" ;;
+  spawn)               cmd_spawn "$@" ;;
+  dispatch)            cmd_dispatch "$@" ;;
+  prompt|send|msg)     cmd_prompt "$@" ;;
+  reply)               cmd_reply "$@" ;;
+  review-status)       cmd_review_status "$@" ;;
+  read)                cmd_read "$@" ;;
+  status|list|ls)      cmd_status "$@" ;;
+  diff)                cmd_diff "$@" ;;
+  merge)               cmd_merge "$@" ;;
+  teardown|rm|kill)    cmd_teardown "$@" ;;
+  version|-v|--version) echo "wt-fleet v${VERSION}" ;;
+  help|-h|--help|*)    usage ;;
+esac

@@ -37,3 +37,11 @@ source /opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 # ------------------------------------------------------------------------------
 # Initialize the Starship prompt
 eval "$(starship init zsh)"
+
+[[ -f "$HOME/.local/bin/env" ]] && . "$HOME/.local/bin/env"
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+
+# Agent Fleet (wt-fleet) shortcuts
+alias wfm="wt-fleet mayor"
+alias wfs="wt-fleet status"
+
