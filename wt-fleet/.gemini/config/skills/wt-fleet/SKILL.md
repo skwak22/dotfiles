@@ -62,7 +62,8 @@ flowchart TD
      writes `.worktrees/<name>/.wt-review.md` and directly prompts the worker
      pane via `wt-fleet prompt <name> "..."` to fix them.
    - Only when `staff` returns `APPROVED` do you present the verified summary to
-     the user for merge approval.
+     the user for merge approval (`wt-fleet merge <name> --teardown`) or GitHub
+     PR creation (see the `gh-pr` skill).
 
 ### Command Reference
 

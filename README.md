@@ -16,4 +16,4 @@ stow --no-folding -t ~ tmux zsh git ghostty wt-fleet
 - **`zsh`**: `.zshrc` with history search, Starship prompt, and `wt-fleet` aliases (`wfm`, `wfs`).
 - **`git`**: `.gitconfig`.
 - **`ghostty`**: Ghostty terminal configuration.
-- **`wt-fleet`**: Portable Git worktree + `tmux` multi-agent orchestrator (`~/bin/wt-fleet`), custom agents (`mayor`, `staff`, `worker`), and modular skills (`wt-fleet`, `staff-review`, `tmux-ops`).
+- **`wt-fleet`**: Portable Git worktree + `tmux` multi-agent orchestrator (`~/bin/wt-fleet`), custom agents (`mayor`, `staff`, `worker`), and modular skills (`wt-fleet`, `staff-review`, `tmux-ops`, `gh-pr`).

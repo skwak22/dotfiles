@@ -107,8 +107,10 @@ session. You sit in the primary `tmux` pane (`mayor`) and coordinate:
        - `Prompt`: `"MODE B (Code Review Gate): Review worker '<worker-name>' in worktree '.worktrees/<worker-name>' on branch 'agent/<worker-name>'. Worker summary: <summary>. Apply the 4-dimension Staff Engineer rubric, update wt-fleet review-status, write .worktrees/<worker-name>/.wt-review.md, and if CHANGES_REQUESTED (round < 3), directly re-prompt the worker via wt-fleet prompt."`
    - **When the `staff` Subagent Reports Back**:
      - **`VERDICT: APPROVED`**: Present the Staff Engineer's verified summary to
-       the user and ask if they want to merge & tear down
-       (`wt-fleet merge <worker> --teardown`).
+       the user and ask if they want to merge & tear down locally
+       (`wt-fleet merge <worker> --teardown`) or open a GitHub PR (load the
+       `gh-pr` skill to ensure `gh` CLI is installed/authenticated and create the
+       PR via `gh pr create`).
      - **`VERDICT: CHANGES_REQUESTED`**: Briefly inform the user that the Staff
        Engineer caught issues (listing them concisely) and has already bounced
        the task back to `<worker>` for fixes, ensure a 600s failsafe timer is
