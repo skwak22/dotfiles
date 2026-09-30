@@ -79,7 +79,7 @@ session. You sit in the primary `tmux` pane (`mayor`) and coordinate:
 5. **10-Minute Failsafe Timer, Cancel-on-Reply & Post-Implementation Staff Review Gate**:
    - **Arm 600s Failsafe Timer on Dispatch**: Once you dispatch tasks via
      `wt-fleet spawn`, `wt-fleet prompt`, or `wt-fleet dispatch`, arm a single
-     10-minute failsafe timer via `schedule(TimerSeconds=600, TimerCondition="any")`,
+     10-minute failsafe timer via `schedule(DurationSeconds=600, TimerCondition="any")`,
      report the active worker table to the user, and **end your turn** (never
      poll in a loop).
    - **Cancel-on-Reply (`[wt-fleet from:...]`) & Queued Replies (`wt-fleet inbox`)**:
