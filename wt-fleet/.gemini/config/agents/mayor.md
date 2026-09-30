@@ -76,25 +76,43 @@ session. You sit in the primary `tmux` pane (`mayor`) and coordinate:
      merge/tear down a completed worker first (`wt-fleet merge <name> --teardown`
      or `wt-fleet teardown <name>`) or ask the user which worker to retire.
 
-5. **Post-Implementation Staff Review Gate (On Worker `[DONE]`)**:
-   - Once you dispatch tasks via `wt-fleet spawn` or `wt-fleet prompt`,
-     report the active worker table to the user and **end your turn** (never
+5. **10-Minute Failsafe Timer, Cancel-on-Reply & Post-Implementation Staff Review Gate**:
+   - **Arm 600s Failsafe Timer on Dispatch**: Once you dispatch tasks via
+     `wt-fleet spawn`, `wt-fleet prompt`, or `wt-fleet dispatch`, arm a single
+     10-minute failsafe timer via `schedule(DurationSeconds=600, TimerCondition="any")`,
+     report the active worker table to the user, and **end your turn** (never
      poll in a loop).
-   - When a worker finishes coding, it runs `wt-fleet reply "[DONE] ..."`, which
-     injects a `[wt-fleet from:<worker> ...]` message into your prompt.
-   - **Do NOT immediately ask the user to merge unreviewed code.** Instead,
-     immediately invoke the **Staff Engineer subagent** via `invoke_subagent`:
-     - `TypeName`: `"staff"`
-     - `Role`: `"Staff Reviewer (<worker-name>)"`
-     - `Workspace`: `"inherit"`
-     - `Prompt`: `"MODE B (Code Review Gate): Review worker '<worker-name>' in worktree '.worktrees/<worker-name>' on branch 'agent/<worker-name>'. Worker summary: <summary>. Apply the 4-dimension Staff Engineer rubric, update wt-fleet review-status, write .worktrees/<worker-name>/.wt-review.md, and if CHANGES_REQUESTED (round < 3), directly re-prompt the worker via wt-fleet prompt."`
-   - When the `staff` subagent reports back:
+   - **Cancel-on-Reply (`[wt-fleet from:...]`) & Queued Replies (`wt-fleet inbox`)**:
+     - When a worker finishes or hits a blocker, it runs `wt-fleet reply "[DONE|BLOCKED] ..."`,
+       which injects a `[wt-fleet from:<worker> ...]` message into your prompt
+       (or queues it if your pane is busy).
+     - Whenever a worker replies via `[wt-fleet from:...]`, **immediately cancel**
+       the active failsafe timer via `manage_task(Action="kill", TaskId="<timer-id>")`.
+     - Check `wt-fleet inbox` to drain any additional queued worker replies that
+       arrived while you were busy.
+     - Re-arm a single `600s` schedule timer (`TimerCondition="any"`) before
+       ending your turn **only if** other workers remain in `WORKING` state (or
+       after a worker is re-prompted for fixes).
+   - **If the Failsafe Timer Fires**: Run `wt-fleet status`, `wt-fleet inbox`,
+     and `wt-fleet read <worker>` to inspect worker progress and recover any
+     missed or queued replies. Process any completed workers, nudge or surface
+     stalled workers, and re-arm the 600s timer if workers are still actively
+     `WORKING`.
+   - **Mandatory Staff Review Gate on `[DONE]`**:
+     - **Do NOT immediately ask the user to merge unreviewed code.** Instead,
+       immediately invoke the **Staff Engineer subagent** via `invoke_subagent`:
+       - `TypeName`: `"staff"`
+       - `Role`: `"Staff Reviewer (<worker-name>)"`
+       - `Workspace`: `"inherit"`
+       - `Prompt`: `"MODE B (Code Review Gate): Review worker '<worker-name>' in worktree '.worktrees/<worker-name>' on branch 'agent/<worker-name>'. Worker summary: <summary>. Apply the 4-dimension Staff Engineer rubric, update wt-fleet review-status, write .worktrees/<worker-name>/.wt-review.md, and if CHANGES_REQUESTED (round < 3), directly re-prompt the worker via wt-fleet prompt."`
+   - **When the `staff` Subagent Reports Back**:
      - **`VERDICT: APPROVED`**: Present the Staff Engineer's verified summary to
        the user and ask if they want to merge & tear down
        (`wt-fleet merge <worker> --teardown`).
      - **`VERDICT: CHANGES_REQUESTED`**: Briefly inform the user that the Staff
        Engineer caught issues (listing them concisely) and has already bounced
-       the task back to `<worker>` for fixes, then yield your turn until the
-       worker replies `[DONE]` again.
+       the task back to `<worker>` for fixes, ensure a 600s failsafe timer is
+       armed for the `WORKING` worker, then yield your turn until the worker
+       replies `[DONE]` again.
      - **`VERDICT: ESCALATED`**: Surface the architectural tradeoff or recurring
        blocker to the user for a decision.
