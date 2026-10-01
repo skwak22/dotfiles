@@ -17,19 +17,51 @@ DEFAULT_MAYOR_PERSONA="${WT_MAYOR_PERSONA:-mayor}"
 DEFAULT_LAYOUT="${WT_LAYOUT:-tiled}"
 DEFAULT_DELIVERY_MODE="${WT_DELIVERY_MODE:-smart}"
 
+# Inspect parent process tree ($PPID) to see if wt-fleet was invoked from inside an active agent CLI
+detect_parent_agent_cli() {
+  local pid="${PPID:-}"
+  local depth=0
+  local candidates=(claude codex gemini aider)
+  if [[ -n "${WT_AGENT_CLI:-}" ]]; then
+    candidates+=("$WT_AGENT_CLI")
+  fi
+  while [[ -n "$pid" && "$pid" != "0" && "$pid" != "1" && $depth -lt 8 ]]; do
+    local comm args
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+    args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    for candidate in "${candidates[@]}"; do
+      if [[ "$comm" == "$candidate" ]] || [[ "$args" =~ (^|[[:space:]/])${candidate}([[:space:]]|$) ]]; then
+        if command -v "$candidate" >/dev/null 2>&1; then
+          echo "$candidate"
+          return 0
+        fi
+      fi
+    done
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
 # Auto-detect agent CLI if WT_AGENT_CLI is not explicitly set
 detect_agent_cli() {
+  local parent_cli=""
+  parent_cli=$(detect_parent_agent_cli || true)
+  if [[ -n "$parent_cli" ]]; then
+    echo "$parent_cli"
+    return 0
+  fi
   if [[ -n "${WT_AGENT_CLI:-}" ]]; then
     echo "$WT_AGENT_CLI"
     return 0
   fi
-  for candidate in gemini claude codex aider; do
+  for candidate in claude codex gemini aider; do
     if command -v "$candidate" >/dev/null 2>&1; then
       echo "$candidate"
       return 0
     fi
   done
-  echo "gemini"
+  echo "claude"
 }
 
 DEFAULT_AGENT_CLI="$(detect_agent_cli)"
@@ -173,22 +205,25 @@ is_tui_rule_line() {
 # Return 0 if line is part of an interactive modal or numbered cursor menu
 is_modal_line() {
   local line="$1"
-  if [[ "$line" =~ ^[[:space:]]*\>[[:space:]]*[0-9]+\.[[:space:]] ]]; then
+  if [[ "$line" =~ ^[[:space:]]*[\>❯›][[:space:]]*[0-9]+\.[[:space:]] ]]; then
     return 0
   fi
   local stripped="${line//\'Requesting permission for:\'/}"
   stripped="${stripped//\'Run this command\?\'/}"
   stripped="${stripped//\'↑\/↓ Navigate\'/}"
   stripped="${stripped//\'Select an option\'/}"
+  stripped="${stripped//\'Do you want to proceed\?\'/}"
+  stripped="${stripped//\'Yes, and don\'t ask again\'/}"
+  stripped="${stripped//\'Allow once\'/}"
   case "$stripped" in
-    *"Requesting permission for:"*|*"Run this command?"*|*"↑/↓ Navigate"*|*"Select an option"*)
+    *"Requesting permission for:"*|*"Run this command?"*|*"↑/↓ Navigate"*|*"Select an option"*|*"Do you want to proceed?"*|*"Yes, and don't ask again"*|*"Allow once"*)
       return 0
       ;;
   esac
   return 1
 }
 
-# Return 0 if text after '>' is active user typing (NOT empty and NOT a built-in TUI placeholder)
+# Return 0 if text after prompt prefix ('>', '❯', '›') is active user typing (NOT empty and NOT a built-in TUI placeholder)
 prompt_text_is_active_input() {
   local raw="$1"
   local trimmed="${raw#"${raw%%[![:space:]]*}"}"
@@ -197,7 +232,7 @@ prompt_text_is_active_input() {
   [[ -n "$trimmed" ]] || return 1
 
   case "$trimmed" in
-    "Accept-edits mode:"*|"Plan mode:"*|"Best-of-N mode:"*|"Type your message"*|"Press "*)
+    "Accept-edits mode:"*|"Plan mode:"*|"Best-of-N mode:"*|"Type your message"*|"Press "*|"Try \""*|"Explain this codebase"*|"Write tests for"*)
       return 1
       ;;
   esac
@@ -283,7 +318,7 @@ pane_check_input_safety_from_text() {
         [[ "$pline" == │* ]] && pline="${pline#│}"
         pline="${pline%"${pline##*[![:space:]]}"}"
         [[ "$pline" == *│ ]] && pline="${pline%│}"
-        if [[ "$pline" =~ ^[[:space:]]*\>(.*)$ ]]; then
+        if [[ "$pline" =~ ^[[:space:]]*[\>❯›](.*)$ ]]; then
           if prompt_text_is_active_input "${BASH_REMATCH[1]}"; then
             return 1
           fi
@@ -300,7 +335,7 @@ pane_check_input_safety_from_text() {
       local box_lines=()
       for (( i = top_idx + 1; i < count; i++ )); do
         case "${lines[$i]}" in
-          "esc to cancel"*) continue ;;
+          "esc to cancel"*|*"bypass permissions"*|*"shift+tab to cycle"*) continue ;;
         esac
         box_lines+=("${lines[$i]}")
       done
@@ -310,7 +345,7 @@ pane_check_input_safety_from_text() {
         return 1
       else
         local pline="${box_lines[0]}"
-        if [[ "$pline" =~ ^[[:space:]]*\>(.*)$ ]]; then
+        if [[ "$pline" =~ ^[[:space:]]*[\>❯›](.*)$ ]]; then
           if prompt_text_is_active_input "${BASH_REMATCH[1]}"; then
             return 1
           fi
@@ -324,23 +359,23 @@ pane_check_input_safety_from_text() {
   fi
 
   # 3. Plain shell prompt or bare prompt fallback (no active '───' TUI box)
-  if (( count > 1 )) && [[ "${lines[0]}" =~ ^[[:space:]]*\> ]]; then
+  if (( count > 1 )) && [[ "${lines[0]}" =~ ^[[:space:]]*[\>❯›] ]]; then
     return 1
   fi
 
   local last_line="${lines[$((count - 1))]}"
-  if [[ "$last_line" =~ ^[[:space:]]*\>(.*)$ ]]; then
+  if [[ "$last_line" =~ ^[[:space:]]*[\>❯›](.*)$ ]]; then
     if prompt_text_is_active_input "${BASH_REMATCH[1]}"; then
       return 1
     fi
     return 0
   fi
 
-  if [[ "$last_line" =~ [$%#\>][[:space:]]*$ ]]; then
+  if [[ "$last_line" =~ [$%#\>❯›][[:space:]]*$ ]]; then
     return 0
   fi
-  if [[ "$last_line" =~ ^[[:space:]]*[$%#\>][[:space:]]+[^[:space:]] ]] \
-    || [[ "$last_line" =~ ^[^[:space:]].*[$%#\>][[:space:]]+[^[:space:]] ]]; then
+  if [[ "$last_line" =~ ^[[:space:]]*[$%#\>❯›][[:space:]]+[^[:space:]] ]] \
+    || [[ "$last_line" =~ ^[^[:space:]].*[$%#\>❯›][[:space:]]+[^[:space:]] ]]; then
     return 1
   fi
 
@@ -536,6 +571,33 @@ allocate_port_offset() {
   echo "100"
 }
 
+# Resolve the active agent CLI (claude, codex, gemini, aider).
+# Precedence: explicit CLI override > .worktrees/.fleet/mayor.env > DEFAULT_AGENT_CLI (parent process / WT_AGENT_CLI / PATH)
+resolve_agent_cli() {
+  local repo_root="${1:-}"
+  local override="${2:-}"
+  if [[ -n "$override" ]]; then
+    echo "$override"
+    return 0
+  fi
+  if [[ -z "$repo_root" ]]; then
+    repo_root=$(get_main_repo_root 2>/dev/null || true)
+  fi
+  if [[ -n "$repo_root" ]]; then
+    local fdir
+    fdir=$(fleet_dir "$repo_root")
+    if [[ -f "${fdir}/mayor.env" ]]; then
+      local saved_cli
+      saved_cli=$(awk -F= '/^AGENT_CLI=/{print $2}' "${fdir}/mayor.env" | tr -d "'\"" 2>/dev/null || true)
+      if [[ -n "$saved_cli" ]]; then
+        echo "$saved_cli"
+        return 0
+      fi
+    fi
+  fi
+  echo "$DEFAULT_AGENT_CLI"
+}
+
 # Determine whether --dangerously-skip-permissions is active.
 # Precedence: explicit CLI override ("1" or "0") > WT_SKIP_PERMISSIONS env > .worktrees/.fleet/mayor.env > "0"
 resolve_skip_permissions() {
@@ -580,10 +642,10 @@ build_worker_launch_cmd() {
   local boot_prompt="${3:-}"
   local skip_perms="${4:-${WT_SKIP_PERMISSIONS:-0}}"
 
-  local skip_flag=""
+  local skip_enabled=false
   case "$skip_perms" in
-    1|true|TRUE|yes|YES|--dangerously-skip-permissions)
-      skip_flag="--dangerously-skip-permissions"
+    1|true|TRUE|yes|YES|--dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox)
+      skip_enabled=true
       ;;
   esac
 
@@ -596,8 +658,8 @@ build_worker_launch_cmd() {
       if [[ -n "$persona" && "$persona" != "default" && "$persona" != "none" ]]; then
         flag="--agent ${persona}"
       fi
-      if [[ -n "$skip_flag" ]]; then
-        flag="${flag:+$flag }${skip_flag}"
+      if $skip_enabled; then
+        flag="${flag:+$flag }--dangerously-skip-permissions"
       fi
       if [[ -n "$boot_prompt" ]]; then
         echo "${cli}${flag:+ $flag} $(printf '%q' "$boot_prompt")"
@@ -605,11 +667,35 @@ build_worker_launch_cmd() {
         echo "${cli}${flag:+ $flag}"
       fi
       ;;
-    codex|aider)
-      if [[ -n "$boot_prompt" ]]; then
-        echo "${cli}${skip_flag:+ $skip_flag} $(printf '%q' "$boot_prompt")"
+    codex)
+      local flag=""
+      if $skip_enabled; then
+        flag="--dangerously-bypass-approvals-and-sandbox"
+      fi
+      local codex_prompt="$boot_prompt"
+      if [[ -n "$persona" && "$persona" != "default" && "$persona" != "none" ]]; then
+        local persona_prefix="First read ~/.codex/agents/${persona}.md and adopt its operating rules."
+        if [[ -n "$codex_prompt" ]]; then
+          codex_prompt="${persona_prefix} ${codex_prompt}"
+        else
+          codex_prompt="${persona_prefix}"
+        fi
+      fi
+      if [[ -n "$codex_prompt" ]]; then
+        echo "${cli}${flag:+ $flag} $(printf '%q' "$codex_prompt")"
       else
-        echo "${cli}${skip_flag:+ $skip_flag}"
+        echo "${cli}${flag:+ $flag}"
+      fi
+      ;;
+    aider)
+      local flag=""
+      if $skip_enabled; then
+        flag="--yes-always"
+      fi
+      if [[ -n "$boot_prompt" ]]; then
+        echo "${cli}${flag:+ $flag} --message $(printf '%q' "$boot_prompt")"
+      else
+        echo "${cli}${flag:+ $flag}"
       fi
       ;;
     *)
@@ -617,8 +703,8 @@ build_worker_launch_cmd() {
       if [[ -n "$persona" && "$persona" != "default" && "$persona" != "none" ]]; then
         flag="--agent ${persona}"
       fi
-      if [[ -n "$skip_flag" ]]; then
-        flag="${flag:+$flag }${skip_flag}"
+      if $skip_enabled; then
+        flag="${flag:+$flag }--dangerously-skip-permissions"
       fi
       if [[ -n "$boot_prompt" ]]; then
         echo "${cli}${flag:+ $flag} -i $(printf '%q' "$boot_prompt")"
@@ -640,6 +726,8 @@ update_registry_md() {
 
   local mayor_pane
   mayor_pane=$(resolve_pane_quiet "mayor" "$repo_root")
+  local active_cli
+  active_cli=$(resolve_agent_cli "$repo_root")
   local skip_perms
   skip_perms=$(resolve_skip_permissions "$repo_root")
   local ibox
@@ -652,6 +740,7 @@ update_registry_md() {
     echo ""
     echo "- **Repository Root**: \`${repo_root}\`"
     echo "- **Mayor Pane**: \`${mayor_pane:-unregistered}\`"
+    echo "- **Agent CLI**: \`${active_cli}\`"
     echo "- **Max Panes Per Window**: \`${MAX_PANES_PER_WINDOW}\`"
     echo "- **Inbox**: \`${icount} queued\`"
     if [[ "$skip_perms" == "1" ]]; then
@@ -721,12 +810,18 @@ update_registry_md() {
 cmd_init() {
   require_tmux
   local skip_override=""
+  local cli_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --dangerously-skip-permissions)
+      --dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox)
         skip_override="1"; shift ;;
       --no-skip-permissions)
         skip_override="0"; shift ;;
+      --cli)
+        [[ $# -ge 2 ]] || die "missing value for --cli"
+        cli_override="$2"; shift 2 ;;
+      --cli=*)
+        cli_override="${1#*=}"; shift ;;
       -h|--help)
         usage; exit 0 ;;
       *)
@@ -750,10 +845,21 @@ cmd_init() {
 
   local skip_perms
   skip_perms=$(resolve_skip_permissions "$repo_root" "$skip_override")
+  local active_cli=""
+  if [[ -n "$cli_override" ]]; then
+    active_cli="$cli_override"
+  elif [[ -n "${WT_AGENT_CLI:-}" ]]; then
+    active_cli="$WT_AGENT_CLI"
+  else
+    active_cli=$(detect_parent_agent_cli || true)
+    [[ -z "$active_cli" ]] && active_cli=$(resolve_agent_cli "$repo_root")
+  fi
   cat > "${fdir}/mayor.env" <<EOF
 MAYOR_PANE=$(printf '%q' "$mayor_pane")
+AGENT_CLI=$(printf '%q' "$active_cli")
 SKIP_PERMISSIONS=$(printf '%q' "$skip_perms")
 EOF
+  export WT_AGENT_CLI="$active_cli"
   if [[ "$skip_perms" == "1" ]]; then
     export WT_SKIP_PERMISSIONS=1
   else
@@ -762,7 +868,7 @@ EOF
 
   update_registry_md "$repo_root"
   info "Initialized wt-fleet in ${repo_root}"
-  info "Current pane (${mayor_pane}) registered as 'mayor' on branch '${cur_branch}'."
+  info "Current pane (${mayor_pane}) registered as 'mayor' on branch '${cur_branch}' (CLI: ${active_cli})."
   if [[ "$skip_perms" == "1" ]]; then
     info "Permissions: SKIP (--dangerously-skip-permissions enabled for Mayor & workers)"
   fi
@@ -771,14 +877,20 @@ EOF
 
 cmd_mayor() {
   local skip_override=""
+  local cli_override=""
   local cli_args=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --dangerously-skip-permissions)
+      --dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox)
         skip_override="1"; shift ;;
       --no-skip-permissions)
         skip_override="0"; shift ;;
+      --cli)
+        [[ $# -ge 2 ]] || die "missing value for --cli"
+        cli_override="$2"; shift 2 ;;
+      --cli=*)
+        cli_override="${1#*=}"; shift ;;
       -h|--help)
         usage; exit 0 ;;
       *)
@@ -786,32 +898,58 @@ cmd_mayor() {
     esac
   done
 
-  if [[ "$skip_override" == "1" ]]; then
-    cmd_init --dangerously-skip-permissions
-  elif [[ "$skip_override" == "0" ]]; then
-    cmd_init --no-skip-permissions
-  else
-    cmd_init
-  fi
+  local init_flags=()
+  [[ "$skip_override" == "1" ]] && init_flags+=("--dangerously-skip-permissions")
+  [[ "$skip_override" == "0" ]] && init_flags+=("--no-skip-permissions")
+  [[ -n "$cli_override" ]] && init_flags+=("--cli" "$cli_override")
+
+  cmd_init ${init_flags[@]+"${init_flags[@]}"}
 
   local repo_root
   repo_root=$(get_main_repo_root)
   local skip_perms
   skip_perms=$(resolve_skip_permissions "$repo_root" "$skip_override")
+  local active_cli
+  active_cli=$(resolve_agent_cli "$repo_root" "$cli_override")
+  local base_cmd
+  base_cmd=$(basename "$active_cli")
 
-  local final_args=()
   if [[ "$skip_perms" == "1" ]]; then
     export WT_SKIP_PERMISSIONS=1
-    final_args+=("--dangerously-skip-permissions")
   else
     export WT_SKIP_PERMISSIONS=0
   fi
-  if (( ${#cli_args[@]} > 0 )); then
-    final_args+=("${cli_args[@]}")
-  fi
 
-  info "Launching Mayor (Orchestrator) agent via ${DEFAULT_AGENT_CLI}..."
-  exec "$DEFAULT_AGENT_CLI" --agent "$DEFAULT_MAYOR_PERSONA" ${final_args[@]+"${final_args[@]}"}
+  local final_args=()
+  case "$base_cmd" in
+    codex)
+      [[ "$skip_perms" == "1" ]] && final_args+=("--dangerously-bypass-approvals-and-sandbox")
+      if (( ${#cli_args[@]} > 0 )); then
+        final_args+=("${cli_args[@]}")
+      else
+        final_args+=("Read and adopt ~/.codex/agents/${DEFAULT_MAYOR_PERSONA}.md as your Mayor orchestrator persona (wt-fleet init is already complete for this pane).")
+      fi
+      info "Launching Mayor (Orchestrator) agent via ${active_cli}..."
+      exec "$active_cli" ${final_args[@]+"${final_args[@]}"}
+      ;;
+    aider)
+      [[ "$skip_perms" == "1" ]] && final_args+=("--yes-always")
+      if (( ${#cli_args[@]} > 0 )); then
+        final_args+=("${cli_args[@]}")
+      fi
+      info "Launching Mayor (Orchestrator) agent via ${active_cli}..."
+      exec "$active_cli" ${final_args[@]+"${final_args[@]}"}
+      ;;
+    *)
+      final_args+=("--agent" "$DEFAULT_MAYOR_PERSONA")
+      [[ "$skip_perms" == "1" ]] && final_args+=("--dangerously-skip-permissions")
+      if (( ${#cli_args[@]} > 0 )); then
+        final_args+=("${cli_args[@]}")
+      fi
+      info "Launching Mayor (Orchestrator) agent via ${active_cli}..."
+      exec "$active_cli" ${final_args[@]+"${final_args[@]}"}
+      ;;
+  esac
 }
 
 cmd_spawn() {
@@ -831,6 +969,7 @@ cmd_spawn() {
   local reuse_existing=false
   local worker_persona="$DEFAULT_WORKER_PERSONA"
   local skip_override=""
+  local cli_override=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -844,7 +983,12 @@ cmd_spawn() {
         reuse_existing=true; shift ;;
       --agent)
         worker_persona="$2"; shift 2 ;;
-      --dangerously-skip-permissions)
+      --cli)
+        [[ $# -ge 2 ]] || die "missing value for --cli"
+        cli_override="$2"; shift 2 ;;
+      --cli=*)
+        cli_override="${1#*=}"; shift ;;
+      --dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox)
         skip_override="1"; shift ;;
       --no-skip-permissions)
         skip_override="0"; shift ;;
@@ -1018,14 +1162,16 @@ EOF
     boot_prompt="You are Worker '${name}' in isolated git worktree '${worktree_path}' on branch '${branch_name}' (base: '${base_branch}'). Read .wt-task.md for full context. Execute your assigned task, commit your verified changes to '${branch_name}', and when finished or blocked run: wt-fleet reply \"[DONE|BLOCKED] <concise summary>\". Task: ${inline_prompt}"
   fi
 
+  local active_cli
+  active_cli=$(resolve_agent_cli "$repo_root" "$cli_override")
   local cli_invocation
-  cli_invocation=$(build_worker_launch_cmd "$DEFAULT_AGENT_CLI" "$worker_persona" "$boot_prompt" "$skip_perms")
-  local launch_cmd="export WT_WORKER_NAME=$(printf '%q' "$name") WT_BRANCH=$(printf '%q' "$branch_name") WT_BASE_BRANCH=$(printf '%q' "$base_branch") WT_MAYOR_PANE=$(printf '%q' "$mayor_pane") WT_PORT_OFFSET=$(printf '%q' "$port_offset") WT_SKIP_PERMISSIONS=$(printf '%q' "$skip_perms"); ${cli_invocation}"
+  cli_invocation=$(build_worker_launch_cmd "$active_cli" "$worker_persona" "$boot_prompt" "$skip_perms")
+  local launch_cmd="export WT_WORKER_NAME=$(printf '%q' "$name") WT_BRANCH=$(printf '%q' "$branch_name") WT_BASE_BRANCH=$(printf '%q' "$base_branch") WT_MAYOR_PANE=$(printf '%q' "$mayor_pane") WT_PORT_OFFSET=$(printf '%q' "$port_offset") WT_SKIP_PERMISSIONS=$(printf '%q' "$skip_perms") WT_AGENT_CLI=$(printf '%q' "$active_cli"); ${cli_invocation}"
 
   tmux send-keys -t "$new_pane" -l -- "$launch_cmd"
   tmux send-keys -t "$new_pane" Enter
 
-  info "Spawned worker '${name}' in pane ${new_pane} (branch: ${branch_name}, path: ${worktree_path})"
+  info "Spawned worker '${name}' in pane ${new_pane} (cli: ${active_cli}, branch: ${branch_name}, path: ${worktree_path})"
 }
 
 cmd_dispatch() {
@@ -1037,10 +1183,14 @@ cmd_dispatch() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --base|--layout|--agent)
+      --base|--layout|--agent|--cli)
         [[ $# -ge 2 ]] || die "missing value for $1"
         spawn_flags+=("$1" "$2")
         shift 2
+        ;;
+      --cli=*)
+        spawn_flags+=("--cli" "${1#*=}")
+        shift
         ;;
       --delivery)
         [[ $# -ge 2 ]] || die "missing value for --delivery (expected: smart, inbox, or push)"
@@ -1072,7 +1222,7 @@ cmd_dispatch() {
     esac
   done
 
-  [[ -n "$raw_name" && -n "$prompt" ]] || die "usage: wt-fleet dispatch <worker-name> \"<prompt>\" [--base <branch>] [--dangerously-skip-permissions|--no-skip-permissions]"
+  [[ -n "$raw_name" && -n "$prompt" ]] || die "usage: wt-fleet dispatch <worker-name> \"<prompt>\" [--base <branch>] [--cli <claude|codex|gemini>] [--dangerously-skip-permissions|--no-skip-permissions]"
   local repo_root
   repo_root=$(get_main_repo_root)
   local name
@@ -1376,6 +1526,150 @@ EOF
   info "Updated worker '${name}' review status -> ${new_status} (round ${round})."
 }
 
+cmd_staff() {
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local cli_override=""
+  local skip_override=""
+  local prompt=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cli)
+        [[ $# -ge 2 ]] || die "missing value for --cli"
+        cli_override="$2"
+        shift 2
+        ;;
+      --cli=*)
+        cli_override="${1#*=}"
+        shift
+        ;;
+      --dangerously-skip-permissions)
+        skip_override="1"
+        shift
+        ;;
+      --no-skip-permissions)
+        skip_override="0"
+        shift
+        ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *)
+        if [[ -z "$prompt" ]]; then
+          prompt="$1"
+        else
+          prompt="${prompt} $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$prompt" ]] || die "usage: wt-fleet staff [--cli <claude|codex|gemini>] \"<prompt>\""
+
+  local active_cli
+  active_cli=$(resolve_agent_cli "$repo_root" "$cli_override")
+  local skip_perms
+  skip_perms=$(resolve_skip_permissions "$repo_root" "$skip_override")
+
+  info "Running headless Staff Engineer via ${active_cli}..."
+  cd "$repo_root"
+
+  case "$active_cli" in
+    claude*)
+      local flags=(--agent staff -p)
+      if [[ "$skip_perms" == "1" ]]; then
+        flags+=(--dangerously-skip-permissions)
+      fi
+      "$active_cli" "${flags[@]}" "$prompt"
+      ;;
+    codex*)
+      local flags=(exec -C "$repo_root")
+      if [[ "$skip_perms" == "1" ]]; then
+        flags+=(--dangerously-bypass-approvals-and-sandbox)
+      else
+        flags+=(--full-auto)
+      fi
+      "$active_cli" "${flags[@]}" "Adopt the Staff Engineer persona and rubric in ~/.codex/agents/staff.md and ~/.codex/skills/staff-review/SKILL.md. ${prompt}"
+      ;;
+    aider*)
+      die "wt-fleet staff does not support headless execution for aider (supported: claude, codex, gemini)"
+      ;;
+    *)
+      local flags=(--agent staff -p)
+      if [[ "$skip_perms" == "1" ]]; then
+        flags+=(--dangerously-skip-permissions)
+      fi
+      "$active_cli" "${flags[@]}" "$prompt"
+      ;;
+  esac
+}
+
+cmd_review() {
+  local repo_root
+  repo_root=$(get_main_repo_root)
+  local fdir
+  fdir=$(fleet_dir "$repo_root")
+  local cli_override=""
+  local skip_override=""
+  local raw_name=""
+  local summary=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cli)
+        [[ $# -ge 2 ]] || die "missing value for --cli"
+        cli_override="$2"
+        shift 2
+        ;;
+      --cli=*)
+        cli_override="${1#*=}"
+        shift
+        ;;
+      --dangerously-skip-permissions)
+        skip_override="1"
+        shift
+        ;;
+      --no-skip-permissions)
+        skip_override="0"
+        shift
+        ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *)
+        if [[ -z "$raw_name" ]]; then
+          raw_name="$1"
+        elif [[ -z "$summary" ]]; then
+          summary="$1"
+        else
+          summary="${summary} $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$raw_name" ]] || die "usage: wt-fleet review <worker-name> [summary] [--cli <claude|codex|gemini>]"
+  local name
+  name=$(sanitize_name "$raw_name")
+  local env_file="${fdir}/${name}.env"
+  [[ -f "$env_file" ]] || die "unknown worker '${name}'"
+  # shellcheck disable=SC1090
+  source "$env_file"
+
+  local worker_summary="${summary:-${LAST_REPLY:-(no worker summary recorded)}}"
+  local review_prompt="MODE B (Code Review Gate): Review worker '${name}' in worktree '${WORKTREE_PATH}' on branch '${BRANCH}' (base: '${BASE_BRANCH}'). Worker summary: ${worker_summary}. Apply the 4-dimension Staff Engineer rubric, update wt-fleet review-status, write ${WORKTREE_PATH}/.wt-review.md, and if CHANGES_REQUESTED (round < 3), directly re-prompt the worker via wt-fleet prompt."
+
+  local staff_args=()
+  [[ -n "$cli_override" ]] && staff_args+=(--cli "$cli_override")
+  if [[ "$skip_override" == "1" ]]; then
+    staff_args+=(--dangerously-skip-permissions)
+  elif [[ "$skip_override" == "0" ]]; then
+    staff_args+=(--no-skip-permissions)
+  fi
+  cmd_staff "${staff_args[@]}" "$review_prompt"
+}
+
 cmd_read() {
   require_tmux
   local repo_root
@@ -1437,9 +1731,12 @@ cmd_status() {
     skip_badge="  |  Permissions: \033[1;31mSKIP (--dangerously-skip-permissions)\033[0m"
   fi
 
+  local active_cli
+  active_cli=$(resolve_agent_cli "$repo_root")
+
   printf "\033[1;36m=== Worktree Fleet Status (%s) ===\033[0m\n" "$(basename "$repo_root")"
   printf "Mayor Pane: \033[1;32m%s\033[0m  |  Window Panes: \033[1;33m%s/%s\033[0m  |  CLI: \033[1;35m%s\033[0m%b%b\n\n" \
-    "${mayor_pane:-unregistered}" "$win_panes" "$MAX_PANES_PER_WINDOW" "$DEFAULT_AGENT_CLI" "$inbox_badge" "$skip_badge"
+    "${mayor_pane:-unregistered}" "$win_panes" "$MAX_PANES_PER_WINDOW" "$active_cli" "$inbox_badge" "$skip_badge"
 
   printf "%-16s %-8s %-15s %-22s %-8s %-10s %s\n" \
     "WORKER" "PANE" "STATUS" "BRANCH" "AHEAD" "TREE" "LAST TASK / REPLY"
@@ -1662,18 +1959,22 @@ cmd_teardown() {
 usage() {
   cat <<'EOF'
 wt-fleet — Portable Git Worktree + tmux Multi-Agent Orchestrator (max 4 panes/window)
+           Compatible with Claude Code (claude), OpenAI Codex (codex), and Gemini CLI (gemini).
 
 Usage:
-  wt-fleet --dangerously-skip-permissions          Init current pane as 'mayor' & launch Mayor with skip-permissions
-  wt-fleet init [--dangerously-skip-permissions]   Label current pane as 'mayor' & init .worktrees/
-  wt-fleet mayor [--dangerously-skip-permissions] [cli-flags...]
-                                                   Init current pane and launch '<agent-cli> --agent mayor'
+  wt-fleet [--cli <claude|codex|gemini>] [--dangerously-skip-permissions]
+                                                   Init current pane as 'mayor' & launch Mayor
+  wt-fleet init [--cli <cli>] [--dangerously-skip-permissions]
+                                                   Label current pane as 'mayor' & init .worktrees/
+  wt-fleet mayor [--cli <cli>] [--dangerously-skip-permissions] [cli-flags...]
+                                                   Init current pane and launch Mayor in selected CLI
   wt-fleet spawn <name> "<prompt>" [options]       Create git worktree + tmux pane & start worker agent
       --base <branch>                              Base branch for worktree (default: current branch)
+      --cli <claude|codex|gemini>                  Agent CLI binary (default: auto-detected or mayor's CLI)
       --reuse                                      If worker pane already exists, send prompt to it
       --layout <tiled|main-vertical|even-horizontal>
       --overflow-window                            Allow opening a new window if current has 4 panes
-      --dangerously-skip-permissions               Launch worker with --dangerously-skip-permissions (inherited from mayor)
+      --dangerously-skip-permissions               Launch worker with skip-permissions (inherited from mayor)
       --no-skip-permissions                        Override inherited skip-permissions for this worker
   wt-fleet dispatch <name> "<prompt>" [options]    Upsert: prompt existing worker or spawn new one
   wt-fleet prompt <name> "<follow-up prompt>" [--delivery <smart|inbox|push>]
@@ -1682,6 +1983,8 @@ Usage:
                                                    (Used by workers) Send status reply back to 'mayor'
                                                    (WT_DELIVERY_MODE=smart|inbox|push, default: smart)
   wt-fleet inbox [list|--flush [--inject]|--clear] View, flush, or clear queued replies from .worktrees/.fleet/inbox.log
+  wt-fleet review <name> [summary] [--cli <cli>]   Run headless Staff Engineer Mode B code review gate for worker
+  wt-fleet staff "<prompt>" [--cli <cli>]          Run headless Staff Engineer Mode A/B prompt
   wt-fleet review-status <name> <VERDICT> [msg]    (Used by staff) Set REVIEWING|APPROVED|CHANGES_REQUESTED|ESCALATED
   wt-fleet status [--watch]                        Show table of all active worktrees, panes, and branches
   wt-fleet read <name> [lines]                     Capture recent terminal output from worker pane
@@ -1694,15 +1997,24 @@ EOF
 # --- Main Dispatch ---
 
 main() {
-  local top_skip_flag=""
+  local top_flags=()
+  local has_top_action=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --dangerously-skip-permissions)
-        top_skip_flag="--dangerously-skip-permissions"
+      --dangerously-skip-permissions|--no-skip-permissions)
+        top_flags+=("$1")
+        has_top_action=true
         shift
         ;;
-      --no-skip-permissions)
-        top_skip_flag="--no-skip-permissions"
+      --cli)
+        [[ $# -ge 2 ]] || die "missing value for --cli"
+        top_flags+=("--cli" "$2")
+        has_top_action=true
+        shift 2
+        ;;
+      --cli=*)
+        top_flags+=("--cli" "${1#*=}")
+        has_top_action=true
         shift
         ;;
       *)
@@ -1712,7 +2024,7 @@ main() {
   done
 
   local cmd=""
-  if [[ $# -eq 0 && "$top_skip_flag" == "--dangerously-skip-permissions" ]]; then
+  if [[ $# -eq 0 && "$has_top_action" == true ]]; then
     cmd="mayor"
   else
     cmd="${1:-help}"
@@ -1720,13 +2032,15 @@ main() {
   fi
 
   case "$cmd" in
-    init)                cmd_init ${top_skip_flag:+"$top_skip_flag"} "$@" ;;
-    mayor)               cmd_mayor ${top_skip_flag:+"$top_skip_flag"} "$@" ;;
-    spawn)               cmd_spawn ${top_skip_flag:+"$top_skip_flag"} "$@" ;;
-    dispatch)            cmd_dispatch ${top_skip_flag:+"$top_skip_flag"} "$@" ;;
+    init)                cmd_init "${top_flags[@]}" "$@" ;;
+    mayor)               cmd_mayor "${top_flags[@]}" "$@" ;;
+    spawn)               cmd_spawn "${top_flags[@]}" "$@" ;;
+    dispatch)            cmd_dispatch "${top_flags[@]}" "$@" ;;
     prompt|send|msg)     cmd_prompt "$@" ;;
     reply)               cmd_reply "$@" ;;
     inbox)               cmd_inbox "$@" ;;
+    review)              cmd_review "${top_flags[@]}" "$@" ;;
+    staff)               cmd_staff "${top_flags[@]}" "$@" ;;
     review-status)       cmd_review_status "$@" ;;
     read)                cmd_read "$@" ;;
     status|list|ls)      cmd_status "$@" ;;

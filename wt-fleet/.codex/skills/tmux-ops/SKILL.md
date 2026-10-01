@@ -1,0 +1,1 @@
+../../../.gemini/config/skills/tmux-ops/SKILL.md

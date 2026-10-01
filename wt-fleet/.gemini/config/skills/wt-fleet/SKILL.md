@@ -69,23 +69,23 @@ flowchart TD
 
 ```bash
 # Initialize current tmux pane as 'mayor' and set up .worktrees/ excludes
-# (Optional --dangerously-skip-permissions persists in .worktrees/.fleet/mayor.env so all spawned workers inherit it)
-wt-fleet init [--dangerously-skip-permissions]
+# Auto-detects if called inside claude, codex, or gemini, or accepts --cli <claude|codex|gemini>
+wt-fleet init [--cli <claude|codex|gemini>] [--dangerously-skip-permissions]
 
-# Initialize current pane as 'mayor' and launch the Mayor orchestrator CLI
-# ('wt-fleet --dangerously-skip-permissions' is shorthand for 'wt-fleet mayor --dangerously-skip-permissions')
-wt-fleet mayor [--dangerously-skip-permissions]
-wt-fleet --dangerously-skip-permissions
+# Initialize current pane as 'mayor' and launch the Mayor orchestrator in your chosen CLI
+wt-fleet mayor [--cli <claude|codex|gemini>] [--dangerously-skip-permissions]
+wt-fleet --cli claude --dangerously-skip-permissions
+wt-fleet --cli codex --dangerously-skip-permissions
 
-# Check all active workers, pane IDs, review status, branches, and commits ahead
+# Check all active workers, pane IDs, active CLI, review status, branches, and commits ahead
 wt-fleet status
 
 # Spawn a new worker in .worktrees/<name> (branch: agent/<name>) + split tmux pane
-# (Automatically inherits --dangerously-skip-permissions from Mayor / WT_SKIP_PERMISSIONS=1; override with --no-skip-permissions)
-wt-fleet spawn <name> "<detailed task prompt>" [--base <branch>] [--dangerously-skip-permissions|--no-skip-permissions]
+# (Inherits active CLI and skip-permissions from Mayor; override with --cli or --no-skip-permissions)
+wt-fleet spawn <name> "<detailed task prompt>" [--base <branch>] [--cli <claude|codex|gemini>] [--dangerously-skip-permissions|--no-skip-permissions]
 
 # Smart upsert: prompt <name> if its pane is alive, otherwise spawn it
-wt-fleet dispatch <name> "<task prompt>" [--base <branch>] [--dangerously-skip-permissions|--no-skip-permissions]
+wt-fleet dispatch <name> "<task prompt>" [--base <branch>] [--cli <claude|codex|gemini>] [--dangerously-skip-permissions|--no-skip-permissions]
 
 # Send follow-up instructions to an already-running worker pane
 wt-fleet prompt <name> "<follow-up instructions>" [--delivery <smart|inbox|push>]
@@ -93,6 +93,11 @@ wt-fleet prompt <name> "<follow-up instructions>" [--delivery <smart|inbox|push>
 # Inspect, flush, or clear queued replies from .worktrees/.fleet/inbox.log
 # (When delivery mode is 'smart' [default], replies are automatically queued to inbox if the target pane has active user typing or an interactive modal)
 wt-fleet inbox [list|--flush [--inject]|--clear]
+
+# Run a headless Staff Engineer Mode B code review or Mode A architectural spec from the CLI
+# (Works across claude -p --agent staff, codex exec, and gemini --agent staff -p)
+wt-fleet review <name> "[worker summary]" [--cli <claude|codex|gemini>]
+wt-fleet staff "<architectural or review prompt>" [--cli <claude|codex|gemini>]
 
 # Update review state (used by Staff Engineer subagent)
 wt-fleet review-status <name> <REVIEWING|APPROVED|CHANGES_REQUESTED|ESCALATED> "[summary]"

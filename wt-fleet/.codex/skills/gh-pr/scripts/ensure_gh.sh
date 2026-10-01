@@ -1,0 +1,1 @@
+../../../../.gemini/config/skills/gh-pr/scripts/ensure_gh.sh
