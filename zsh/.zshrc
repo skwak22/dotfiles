@@ -63,7 +63,7 @@ export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 # Agent Fleet (wt-fleet) shortcuts (Gemini CLI, Claude Code, OpenAI Codex)
 alias wfm="wt-fleet mayor"
 alias wfmc="wt-fleet mayor --cli claude"
-alias wfmx="wt-fleet mayor --cli codex"
+alias wfmx="wt-fleet --cli codex mayor"
 alias wfmg="wt-fleet mayor --cli gemini"
 alias wfs="wt-fleet status"
 alias wfi="wt-fleet inbox"
